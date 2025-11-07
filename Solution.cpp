@@ -1,0 +1,724 @@
+#include "Solution.h"
+
+Solution::Solution(PatrollingInput* input, Pathfinder* pathfinder) {
+	// Initialize the size information
+	m_input = input;
+	m_pathfinder = pathfinder;
+
+	// Add action vectors for each drone/UGV
+	for (int j = 0; j < m_input->GetMa(); j++) {
+		std::vector<DroneAction> action_list;
+		m_Aa.push_back(action_list);
+	}
+	for (int j = 0; j < m_input->GetMg(); j++) {
+		std::vector<UGVAction> action_list;
+		m_Ag.push_back(action_list);
+	}
+}
+
+Solution::Solution(const Solution& other) {
+	m_input = other.m_input;
+	m_pathfinder = other.m_pathfinder;
+
+	// Add action vectors for each drone/UGV
+	for (int j = 0; j < m_input->GetMa(); j++) {
+		std::vector<DroneAction> action_list;
+		m_Aa.push_back(action_list);
+		// Move over all of the other solution's actions
+		for (DroneAction action : other.m_Aa.at(j)) {
+			m_Aa.at(j).push_back(action);
+		}
+	}
+	for (int j = 0; j < m_input->GetMg(); j++) {
+		std::vector<UGVAction> action_list;
+		m_Ag.push_back(action_list);
+		// Move over all of the other solution's actions
+		for (UGVAction action : other.m_Ag.at(j)) {
+			m_Ag.at(j).push_back(action);
+		}
+	}
+}
+
+Solution& Solution::operator=(const Solution& other) {
+	m_input = other.m_input;
+	m_pathfinder = other.m_pathfinder;
+
+	m_Aa.clear();
+	m_Ag.clear();
+
+	// Add action vectors for each drone/UGV
+	for (int j = 0; j < m_input->GetMa(); j++) {
+		std::vector<DroneAction> action_list;
+		m_Aa.push_back(action_list);
+		// Move over all of the other solution's actions
+		for (DroneAction action : other.m_Aa.at(j)) {
+			m_Aa.at(j).push_back(action);
+		}
+	}
+	for (int j = 0; j < m_input->GetMg(); j++) {
+		std::vector<UGVAction> action_list;
+		m_Ag.push_back(action_list);
+		// Move over all of the other solution's actions
+		for (UGVAction action : other.m_Ag.at(j)) {
+			m_Ag.at(j).push_back(action);
+		}
+	}
+
+	return *this;
+}
+
+Solution::~Solution() {
+}
+
+
+// Calculates the average penalty accumulation rate
+// Calculates the average penalty accumulation rate
+// Calculates the average penalty accumulation rate
+double Solution::CalculatePar() {
+	double ret_val = 0.0;
+
+	// If there are no nodes to patrol, PAR is 0.
+	if (m_input->GetN() == 0) {
+		return 0.0;
+	}
+
+	// Create a queue for times for each sensor
+	std::vector< std::priority_queue<NodeService, std::vector<NodeService>, CompareNoderService> > Visits_i;
+	for (int i = 0; i < m_input->GetN(); i++) {
+		std::priority_queue<NodeService, std::vector<NodeService>, CompareNoderService> servicing_queue;
+		Visits_i.push_back(servicing_queue);
+	}
+
+	// For each drone...
+	for (const auto& action_list : m_Aa) {
+		double prev_kernel_end = 0.0;
+		// Simulate the drone's kernel for ns trials
+		for (int l = 0; l < N_S; l++) {
+			for (const auto& action : action_list) {
+				// Did the drone visit a PoI?
+				if (action.mActionType == E_DroneActionTypes::e_MoveToNode) {
+					// *** THIS IS THE CORRECT FIX ***
+					if (action.mDetails >= 0 && action.mDetails < m_input->GetN()) {
+						NodeService srv(action.fCompletionTime + prev_kernel_end, action.mActionID);
+						// Push the completion time onto the respective PoI's queue
+						Visits_i.at(action.mDetails).emplace(srv);
+					}
+				}
+				// Is this the end of the kernel?
+				if (action.mActionType == E_DroneActionTypes::e_KernelEnd) {
+					// Update when the previous kernel ends
+					prev_kernel_end = action.fCompletionTime;
+				}
+			}
+		}
+	}
+
+	// For each UGV...
+	for (const auto& action_list : m_Ag) {
+		double prev_kernel_end = 0.0;
+		// Simulate the UGV's kernel for ns trials
+		for (int l = 0; l < N_S; l++) {
+			for (const auto& action : action_list) {
+				// Did the UGV visit a PoI?
+				if (action.mActionType == E_UGVActionTypes::e_MoveToNode) {
+					// *** THIS IS THE CORRECT FIX ***
+					if (action.mDetails >= 0 && action.mDetails < m_input->GetN()) {
+						NodeService srv(action.fCompletionTime + prev_kernel_end, action.mActionID);
+						// Push the completion time onto the respective PoI's queue
+						Visits_i.at(action.mDetails).emplace(srv);
+					}
+				}
+				// Is this the end of the kernel?
+				if (action.mActionType == E_UGVActionTypes::e_KernelEnd) {
+					// Update when the previous kernel ends
+					prev_kernel_end = action.fCompletionTime;
+				}
+			}
+		}
+	}
+
+	if (DEBUG_SOL) {
+		printf("Cycling through visits to build S:\n");
+	}
+
+	std::vector<std::vector<double>> S;
+	for (auto queue : Visits_i) { // Use a COPY of the queue
+		if (queue.empty()) {
+			S.emplace_back();
+			continue;
+		}
+
+		std::vector<double> S_i;
+		double prev = queue.top().time / 3600.0;
+		int first_id = queue.top().ActionID;
+		queue.pop();
+
+		if (DEBUG_SOL) printf(" (%d:%f)", first_id, prev);
+
+		bool run_again = true;
+		while (!queue.empty() && run_again) {
+			double next = queue.top().time / 3600.0;
+			S_i.push_back(next - prev);
+
+			if (DEBUG_SOL) printf(" (%d:%f)", queue.top().ActionID, next);
+
+			if (queue.top().ActionID == first_id) {
+				run_again = false;
+			}
+			else {
+				prev = next;
+				queue.pop();
+			}
+		}
+		S.push_back(S_i);
+	}
+
+	if (DEBUG_SOL) printf("Total duration of each node kernel:\n");
+
+	for (const auto& S_i : S) {
+		double total_time = 0.0;
+		for (double t_i : S_i) {
+			total_time += t_i;
+		}
+		if (DEBUG_SOL) printf("%f\n", total_time);
+
+		if (total_time > EPSILON) {
+			for (double t_i : S_i) {
+				ret_val += (t_i * t_i) / (2 * total_time);
+			}
+		}
+	}
+
+	if (DEBUG_SOL) printf("PAR: %f\n", ret_val);
+
+	return ret_val;
+}
+
+
+// Prints this solution
+void Solution::PrintSolution() {
+	printf("Solution: N = %d, Ma = %d, Mg = %d\n", m_input->GetN(), m_input->GetMa(), m_input->GetMg());
+
+	// Print the actions of each robot
+	for (int j = 0; j < m_input->GetMa(); j++) {
+		printf("Drone %d:\n", j);
+		for (DroneAction action : m_Aa.at(j)) {
+			printf("  [%d] %d(%d) : (%f, %f) - %f\n", action.mActionID, static_cast<std::underlying_type<E_DroneActionTypes>::type>(action.mActionType), action.mDetails, action.fX, action.fY, action.fCompletionTime);
+		}
+	}
+	for (int j = 0; j < m_input->GetMg(); j++) {
+		printf("UGV %d:\n", j);
+		for (UGVAction action : m_Ag.at(j)) {
+			printf("  [%d] %d(%d) : (%f, %f) - %f\n", action.mActionID, static_cast<std::underlying_type<E_UGVActionTypes>::type>(action.mActionType), action.mDetails, action.fX, action.fY, action.fCompletionTime);
+		}
+	}
+}
+
+// Prints the current solution into a yaml file (for testing with ARL)
+void Solution::GenerateYAML(const std::string& filename) {
+	//	m_input
+	YAML::Emitter out;
+	out << YAML::Comment("API Version: 0.9.1");
+	out << YAML::BeginMap;
+	out << YAML::Key << "ID" << YAML::Value << "plan_every_UAV_action_02";
+	out << YAML::Key << "state_ID" << YAML::Value << "state_every_UAV_action_02";
+	out << YAML::Key << "description" << YAML::Value << "Team Patrolling";
+	out << YAML::Key << "start_time" << YAML::Value << floatingPointToString(0.0);
+
+	double longest_end = 0.0;
+	for (int a_j = 0; a_j < boost::numeric_cast<int>(m_Ag.size()); a_j++) {
+		if (m_Ag.at(a_j).back().fCompletionTime > longest_end) {
+			longest_end = m_Ag.at(a_j).back().fCompletionTime;
+		}
+	}
+	out << YAML::Key << "end_time" << YAML::Value << floatingPointToString(longest_end);
+
+	out << YAML::Key << "individual_plans" << YAML::Value << YAML::BeginSeq;
+
+	// UAV Plans
+	for (int a_j = 0; a_j < boost::numeric_cast<int>(m_Aa.size()); a_j++) {
+		out << YAML::BeginMap;
+		out << YAML::Key << "agent_ID" << YAML::Value << m_input->GetDroneID(a_j);
+		out << YAML::Key << "actions" << YAML::Value << YAML::BeginSeq;
+
+		// Track the time of the last action
+		double last_t = 0.0;
+		double prev_x = 0.0, prev_y = 0.0;
+
+		// Create a generic "start" actions
+		{
+			out << YAML::BeginMap;
+			out << YAML::Key << "type" << YAML::Value << "start";
+			out << YAML::Key << "start_time" << YAML::Value << floatingPointToString(last_t);
+			out << YAML::Key << "end_time" << YAML::Value << floatingPointToString(last_t);
+			out << YAML::Key << "task_parameters" << YAML::Value << YAML::BeginMap;
+			out << YAML::Key << "location" << YAML::Value << YAML::BeginMap;
+			out << YAML::Key << "x" << YAML::Value << floatingPointToString(m_Aa.at(a_j).front().fX);
+			out << YAML::Key << "y" << YAML::Value << floatingPointToString(m_Aa.at(a_j).front().fY);
+			out << YAML::EndMap;
+			out << YAML::EndMap;
+			out << YAML::EndMap;
+
+			prev_x = m_Aa.at(a_j).front().fX;
+			prev_y = m_Aa.at(a_j).front().fY;
+		}
+
+		for (const auto& action : m_Aa.at(a_j)) {
+			if (action.mActionType == E_DroneActionTypes::e_LaunchFromUGV) {
+				// Record that the drone was purched on the UGV
+				UAV uav = m_input->getUAV(a_j);
+				out << YAML::BeginMap;
+				out << YAML::Key << "type" << YAML::Value << "perch_on_UGV";
+				out << YAML::Key << "start_time" << YAML::Value << floatingPointToString(last_t);
+				out << YAML::Key << "end_time" << YAML::Value << floatingPointToString(action.fCompletionTime - uav.timeNeededToLaunch);
+				out << YAML::Key << "task_parameters" << YAML::Value << YAML::BeginMap;
+				out << YAML::Key << "pad_ID" << YAML::Value << "pad_01";
+				out << YAML::Key << "origin" << YAML::Value << YAML::BeginMap;
+				out << YAML::Key << "x" << YAML::Value << floatingPointToString(prev_x);
+				out << YAML::Key << "y" << YAML::Value << floatingPointToString(prev_y);
+				out << YAML::EndMap;
+				out << YAML::Key << "destination" << YAML::Value << YAML::BeginMap;
+				out << YAML::Key << "x" << YAML::Value << floatingPointToString(action.fX);
+				out << YAML::Key << "y" << YAML::Value << floatingPointToString(action.fY);
+				out << YAML::EndMap;
+				out << YAML::EndMap;
+				out << YAML::EndMap;
+				// Launch the drone
+				out << YAML::BeginMap;
+				out << YAML::Key << "type" << YAML::Value << "takeoff_from_UGV";;
+				out << YAML::Key << "start_time" << YAML::Value << floatingPointToString(action.fCompletionTime - uav.timeNeededToLaunch);
+				out << YAML::Key << "end_time" << YAML::Value << floatingPointToString(action.fCompletionTime);
+				out << YAML::Key << "task_parameters" << YAML::Value << YAML::BeginMap;
+				out << YAML::Key << "pad_ID" << YAML::Value << "pad_01";
+				out << YAML::Key << "start_progress" << YAML::Value << floatingPointToString(0.0);
+				out << YAML::Key << "end_progress" << YAML::Value << floatingPointToString(1.0);
+				out << YAML::Key << "location" << YAML::Value << YAML::BeginMap;
+				out << YAML::Key << "x" << YAML::Value << floatingPointToString(action.fX);
+				out << YAML::Key << "y" << YAML::Value << floatingPointToString(action.fY);
+				out << YAML::EndMap;
+				out << YAML::EndMap;
+				out << YAML::EndMap;
+			}
+			else if (action.mActionType == E_DroneActionTypes::e_MoveToNode || action.mActionType == E_DroneActionTypes::e_MoveToUGV) {
+				// First move to the node
+				out << YAML::BeginMap;
+				out << YAML::Key << "type" << YAML::Value << "move_to_location";
+				out << YAML::Key << "start_time" << YAML::Value << floatingPointToString(last_t);
+				out << YAML::Key << "end_time" << YAML::Value << floatingPointToString(action.fCompletionTime);
+				out << YAML::Key << "task_parameters" << YAML::Value << YAML::BeginMap;
+				out << YAML::Key << "origin" << YAML::Value << YAML::BeginMap;
+				out << YAML::Key << "x" << YAML::Value << floatingPointToString(prev_x);
+				out << YAML::Key << "y" << YAML::Value << floatingPointToString(prev_y);
+				out << YAML::EndMap;
+				out << YAML::Key << "destination" << YAML::Value << YAML::BeginMap;
+				out << YAML::Key << "x" << YAML::Value << floatingPointToString(action.fX);
+				out << YAML::Key << "y" << YAML::Value << floatingPointToString(action.fY);
+				out << YAML::EndMap;
+				out << YAML::EndMap;
+				out << YAML::EndMap;
+				// Did we move to a node?
+				if (action.mActionType == E_DroneActionTypes::e_MoveToNode && action.mDetails >= 0) {
+					// Service the node
+					out << YAML::BeginMap;
+					out << YAML::Key << "type" << YAML::Value << "service_node";;
+					out << YAML::Key << "start_time" << YAML::Value << floatingPointToString(action.fCompletionTime);
+					out << YAML::Key << "end_time" << YAML::Value << floatingPointToString(action.fCompletionTime);
+					out << YAML::Key << "task_parameters" << YAML::Value << YAML::BeginMap;
+					out << YAML::Key << "node_ID" << YAML::Value << m_input->GetNodeID(action.mDetails);
+					out << YAML::Key << "location" << YAML::Value << YAML::BeginMap;
+					out << YAML::Key << "x" << YAML::Value << floatingPointToString(action.fX);
+					out << YAML::Key << "y" << YAML::Value << floatingPointToString(action.fY);
+					out << YAML::EndMap;
+					out << YAML::EndMap;
+					out << YAML::EndMap;
+				}
+			}
+			else if (action.mActionType == E_DroneActionTypes::e_LandOnUGV) {
+				// Land on UGV
+				out << YAML::BeginMap;
+				out << YAML::Key << "type" << YAML::Value << "land_on_UGV";;
+				out << YAML::Key << "start_time" << YAML::Value << floatingPointToString(last_t);
+				out << YAML::Key << "end_time" << YAML::Value << floatingPointToString(action.fCompletionTime);
+				out << YAML::Key << "task_parameters" << YAML::Value << YAML::BeginMap;
+				out << YAML::Key << "pad_ID" << YAML::Value << "pad_01";
+				out << YAML::Key << "location" << YAML::Value << YAML::BeginMap;
+				out << YAML::Key << "x" << YAML::Value << floatingPointToString(action.fX);
+				out << YAML::Key << "y" << YAML::Value << floatingPointToString(action.fY);
+				out << YAML::EndMap;
+				out << YAML::Key << "start_progress" << YAML::Value << floatingPointToString(0.0);
+				out << YAML::Key << "end_progress" << YAML::Value << floatingPointToString(1.0);
+				out << YAML::EndMap;
+				out << YAML::EndMap;
+			}
+
+			// Update previous location
+			prev_x = action.fX;
+			prev_y = action.fY;
+			last_t = action.fCompletionTime;
+		}
+
+		// Create a generic "end" actions
+		{
+			out << YAML::BeginMap;
+			out << YAML::Key << "type" << YAML::Value << "end";
+			out << YAML::Key << "start_time" << YAML::Value << floatingPointToString(m_Aa.at(a_j).back().fCompletionTime);
+			out << YAML::Key << "end_time" << YAML::Value << floatingPointToString(m_Aa.at(a_j).back().fCompletionTime);
+			out << YAML::Key << "task_parameters" << YAML::Value << YAML::BeginMap;
+			out << YAML::Key << "location" << YAML::Value << YAML::BeginMap;
+			out << YAML::Key << "x" << YAML::Value << floatingPointToString(m_Aa.at(a_j).back().fX);
+			out << YAML::Key << "y" << YAML::Value << floatingPointToString(m_Aa.at(a_j).back().fY);
+			out << YAML::EndMap;
+			out << YAML::EndMap;
+			out << YAML::EndMap;
+		}
+
+		out << YAML::EndSeq;
+		out << YAML::EndMap;
+	}
+
+	// UGV Plans m_Ag
+	for (int a_j = 0; a_j < boost::numeric_cast<int>(m_Ag.size()); a_j++) {
+		out << YAML::BeginMap;
+		out << YAML::Key << "agent_ID" << YAML::Value << m_input->GetUGVID(a_j);
+		out << YAML::Key << "actions" << YAML::Value << YAML::BeginSeq;
+
+		// Track the time of the last action
+		double last_t = 0.0;
+		double prev_x = 0.0, prev_y = 0.0;
+
+		// Create a generic "start" actions
+		{
+			out << YAML::BeginMap;
+			out << YAML::Key << "type" << YAML::Value << "start";
+			out << YAML::Key << "start_time" << YAML::Value << floatingPointToString(last_t);
+			out << YAML::Key << "end_time" << YAML::Value << floatingPointToString(last_t);
+			out << YAML::Key << "task_parameters" << YAML::Value << YAML::BeginMap;
+			out << YAML::Key << "location" << YAML::Value << YAML::BeginMap;
+			out << YAML::Key << "x" << YAML::Value << floatingPointToString(m_Ag.at(a_j).front().fX);
+			out << YAML::Key << "y" << YAML::Value << floatingPointToString(m_Ag.at(a_j).front().fY);
+			out << YAML::EndMap;
+			out << YAML::EndMap;
+			out << YAML::EndMap;
+
+			prev_x = m_Ag.at(a_j).front().fX;
+			prev_y = m_Ag.at(a_j).front().fY;
+		}
+
+		for (const auto& action : m_Ag.at(a_j)) {
+			if (action.mActionType == E_UGVActionTypes::e_MoveToWaypoint || action.mActionType == E_UGVActionTypes::e_MoveToDepot) {
+				if (CREATE_SPLINES) {
+					// We need to break this up into smaller legs
+					double crnt_x = prev_x;
+					double crnt_y = prev_y;
+
+					// While we are further than the max spline segment distance
+					// while(distAtoB(crnt_x, crnt_y, action.fX, action.fY) > UGV_SPLINE_SEG_DIST) {
+					double ugv_spline_seg_d = m_input->getUGV(a_j).SPlineSegDist;
+					// *** MODIFICATION HERE ***
+					while (m_pathfinder->get_path_distance({ crnt_x, crnt_y }, { action.fX, action.fY }) > ugv_spline_seg_d) {
+						// Increment forward
+						double delta_X = action.fX - prev_x;
+						double delta_Y = action.fY - prev_y;
+						double theta = 0.0;
+						if (!isZero(delta_X)) {
+							theta = atan(delta_Y / delta_X);
+							if (delta_X < 0) {
+								theta += PI;
+							}
+						}
+						else {
+							if (delta_Y > 0) {
+								theta = PI / 2.0;
+							}
+							else {
+								theta = PI / -2.0;
+							}
+						}
+						double delta_x = cos(theta) * ugv_spline_seg_d;
+						double delta_y = sin(theta) * ugv_spline_seg_d;
+						// How far are we going? (we expect this to be 10 m)
+						// *** MODIFICATION HERE ***
+						double seg_dist = m_pathfinder->get_path_distance({ crnt_x, crnt_y }, { crnt_x + delta_x, crnt_y + delta_y });
+
+						double seg_t = seg_dist / m_input->getUGV(a_j).ugv_v_crg;
+
+						// Move the UGV over this distance
+						out << YAML::BeginMap;
+						out << YAML::Key << "type" << YAML::Value << "move_to_location";
+						out << YAML::Key << "start_time" << YAML::Value << floatingPointToString(last_t);
+						out << YAML::Key << "end_time" << YAML::Value << floatingPointToString(last_t + seg_t);
+						out << YAML::Key << "task_parameters" << YAML::Value << YAML::BeginMap;
+						out << YAML::Key << "origin" << YAML::Value << YAML::BeginMap;
+						out << YAML::Key << "x" << YAML::Value << floatingPointToString(crnt_x);
+						out << YAML::Key << "y" << YAML::Value << floatingPointToString(crnt_y);
+						out << YAML::EndMap;
+						out << YAML::Key << "destination" << YAML::Value << YAML::BeginMap;
+						out << YAML::Key << "x" << YAML::Value << floatingPointToString(crnt_x + delta_x);
+						out << YAML::Key << "y" << YAML::Value << floatingPointToString(crnt_y + delta_y);
+						out << YAML::EndMap;
+						out << YAML::EndMap;
+						out << YAML::EndMap;
+
+						// Update for next iteration
+						crnt_x += delta_x;
+						crnt_y += delta_y;
+						last_t += seg_t;
+
+					}
+
+					// Add in the last leg (will be less than UGV_SPLINE_SEG_DIST in distance)
+					out << YAML::BeginMap;
+					out << YAML::Key << "type" << YAML::Value << "move_to_location";
+					out << YAML::Key << "start_time" << YAML::Value << floatingPointToString(last_t);
+					out << YAML::Key << "end_time" << YAML::Value << floatingPointToString(action.fCompletionTime);
+					out << YAML::Key << "task_parameters" << YAML::Value << YAML::BeginMap;
+					out << YAML::Key << "origin" << YAML::Value << YAML::BeginMap;
+					out << YAML::Key << "x" << YAML::Value << floatingPointToString(crnt_x);
+					out << YAML::Key << "y" << YAML::Value << floatingPointToString(crnt_y);
+					out << YAML::EndMap;
+					out << YAML::Key << "destination" << YAML::Value << YAML::BeginMap;
+					out << YAML::Key << "x" << YAML::Value << floatingPointToString(action.fX);
+					out << YAML::Key << "y" << YAML::Value << floatingPointToString(action.fY);
+					out << YAML::EndMap;
+					out << YAML::EndMap;
+					out << YAML::EndMap;
+				}
+				else {
+					// Just go directly to the next point
+					out << YAML::BeginMap;
+					out << YAML::Key << "type" << YAML::Value << "move_to_location";
+					out << YAML::Key << "start_time" << YAML::Value << floatingPointToString(last_t);
+					out << YAML::Key << "end_time" << YAML::Value << floatingPointToString(action.fCompletionTime);
+					out << YAML::Key << "task_parameters" << YAML::Value << YAML::BeginMap;
+					out << YAML::Key << "origin" << YAML::Value << YAML::BeginMap;
+					out << YAML::Key << "x" << YAML::Value << floatingPointToString(prev_x);
+					out << YAML::Key << "y" << YAML::Value << floatingPointToString(prev_y);
+					out << YAML::EndMap;
+					out << YAML::Key << "destination" << YAML::Value << YAML::BeginMap;
+					out << YAML::Key << "x" << YAML::Value << floatingPointToString(action.fX);
+					out << YAML::Key << "y" << YAML::Value << floatingPointToString(action.fY);
+					out << YAML::EndMap;
+					out << YAML::EndMap;
+					out << YAML::EndMap;
+				}
+
+				// Did we go to the depot?
+				if (action.mActionType == E_UGVActionTypes::e_MoveToDepot) {
+					// Swap-out batteries
+					out << YAML::BeginMap;
+					out << YAML::Key << "type" << YAML::Value << "swap_battery";
+					out << YAML::Key << "start_time" << YAML::Value << floatingPointToString(action.fCompletionTime);
+					UGV ugv = m_input->getUGV(a_j);
+					out << YAML::Key << "end_time" << YAML::Value << floatingPointToString(action.fCompletionTime + ugv.batterySwapTime);
+					out << YAML::Key << "task_parameters" << YAML::Value << YAML::BeginMap;
+					out << YAML::Key << "start_progress" << YAML::Value << floatingPointToString(0.0);
+					out << YAML::Key << "end_progress" << YAML::Value << floatingPointToString(1.0);
+					out << YAML::Key << "location" << YAML::Value << YAML::BeginMap;
+					out << YAML::Key << "x" << YAML::Value << floatingPointToString(action.fX);
+					out << YAML::Key << "y" << YAML::Value << floatingPointToString(action.fY);
+					out << YAML::EndMap;
+					out << YAML::EndMap;
+					out << YAML::EndMap;
+				}
+			}
+			else if (action.mActionType == E_UGVActionTypes::e_LaunchDrone) {
+				UAV uav = m_input->getUAV(a_j);
+				out << YAML::BeginMap;
+				out << YAML::Key << "type" << YAML::Value << "allow_takeoff_by_UAV";
+				out << YAML::Key << "start_time" << YAML::Value << floatingPointToString(action.fCompletionTime - uav.timeNeededToLaunch);
+				out << YAML::Key << "end_time" << YAML::Value << floatingPointToString(action.fCompletionTime);
+				out << YAML::Key << "task_parameters" << YAML::Value << YAML::BeginMap;
+				out << YAML::Key << "UAV_ID" << YAML::Value << m_input->GetDroneID(action.mDetails);
+				out << YAML::Key << "pad_ID" << YAML::Value << "pad_01";
+				out << YAML::Key << "start_progress" << YAML::Value << floatingPointToString(0.0);
+				out << YAML::Key << "end_progress" << YAML::Value << floatingPointToString(1.0);
+				out << YAML::Key << "location" << YAML::Value << YAML::BeginMap;
+				out << YAML::Key << "x" << YAML::Value << floatingPointToString(action.fX);
+				out << YAML::Key << "y" << YAML::Value << floatingPointToString(action.fY);
+				out << YAML::EndMap;
+				out << YAML::EndMap;
+				out << YAML::EndMap;
+			}
+			else if (action.mActionType == E_UGVActionTypes::e_ReceiveDrone) {
+				UAV uav = m_input->getUAV(a_j);
+				out << YAML::BeginMap;
+				out << YAML::Key << "type" << YAML::Value << "allow_landing_by_UAV";
+				out << YAML::Key << "start_time" << YAML::Value << floatingPointToString(action.fCompletionTime - uav.timeNeededToLand);
+				out << YAML::Key << "end_time" << YAML::Value << floatingPointToString(action.fCompletionTime);
+				out << YAML::Key << "task_parameters" << YAML::Value << YAML::BeginMap;
+				out << YAML::Key << "UAV_ID" << YAML::Value << m_input->GetDroneID(action.mDetails);
+				out << YAML::Key << "pad_ID" << YAML::Value << "pad_01";
+				out << YAML::Key << "start_progress" << YAML::Value << floatingPointToString(0.0);
+				out << YAML::Key << "end_progress" << YAML::Value << floatingPointToString(1.0);
+				out << YAML::Key << "location" << YAML::Value << YAML::BeginMap;
+				out << YAML::Key << "x" << YAML::Value << floatingPointToString(action.fX);
+				out << YAML::Key << "y" << YAML::Value << floatingPointToString(action.fY);
+				out << YAML::EndMap;
+				out << YAML::EndMap;
+				out << YAML::EndMap;
+			}
+
+			// Update previous location
+			prev_x = action.fX;
+			prev_y = action.fY;
+			last_t = action.fCompletionTime;
+		}
+
+		// Create a generic "end" actions
+		{
+			out << YAML::BeginMap;
+			out << YAML::Key << "type" << YAML::Value << "end";
+			out << YAML::Key << "start_time" << YAML::Value << floatingPointToString(m_Aa.at(a_j).back().fCompletionTime);
+			out << YAML::Key << "end_time" << YAML::Value << floatingPointToString(m_Aa.at(a_j).back().fCompletionTime);
+			out << YAML::Key << "task_parameters" << YAML::Value << YAML::BeginMap;
+			out << YAML::Key << "location" << YAML::Value << YAML::BeginMap;
+			out << YAML::Key << "x" << YAML::Value << floatingPointToString(m_Aa.at(a_j).back().fX);
+			out << YAML::Key << "y" << YAML::Value << floatingPointToString(m_Aa.at(a_j).back().fY);
+			out << YAML::EndMap;
+			out << YAML::EndMap;
+			out << YAML::EndMap;
+		}
+
+		out << YAML::EndSeq;
+		out << YAML::EndMap;
+	}
+
+	out << YAML::EndSeq;
+	out << YAML::EndMap;
+
+	std::ofstream fout(filename);
+	fout << out.c_str();
+	fout.close();
+}
+
+
+// Calculates the Penalty Accumulation Rate of the current solution stored in this solution object.
+double Solution::Benchmark() {
+	return INF;
+}
+
+
+// Determines if this is a valid assignment solution (doesn't break constraints)
+bool Solution::ValidSolution() {
+	/// Check each set of constraints
+	bool valid = false;
+
+	return valid;
+}
+
+// Pushes action onto drone j's action list
+void Solution::PushDroneAction(int j, const DroneAction& action) {
+	m_Aa.at(j).push_back(action);
+}
+
+// Pushes action onto UGV j's action list
+void Solution::PushUGVAction(int j, const UGVAction& action) {
+	m_Ag.at(j).push_back(action);
+}
+
+// Get the last action for drone j
+const DroneAction& Solution::GetLastDroneAction(int j) {
+	if (m_Aa.at(j).empty()) {
+		// No previous actions, push in some dummy action
+		DroneAction dummy(E_DroneActionTypes::e_AtUGV, 0, 0, 0);
+		m_Aa.at(j).push_back(dummy);
+
+		// Print some nasty message
+		fprintf(stderr, "[ERROR]:Solution::GetLastDroneAction(): Drone action array %d is empty!\n", j);
+	}
+
+	return m_Aa.at(j).back();
+}
+
+// Get the last action for UGV j
+const UGVAction& Solution::GetLastUGVAction(int j) {
+	if (m_Ag.at(j).empty()) {
+		// No previous actions, push in some dummy action
+		UGVAction dummy(E_UGVActionTypes::e_AtDepot, 0, 0, 0);
+		m_Ag.at(j).push_back(dummy);
+
+		// Print some nasty message
+		fprintf(stderr, "[ERROR]:Solution::GetLastUGVAction(): UGV action array %d is empty!\n", j);
+	}
+
+	return m_Ag.at(j).back();
+}
+
+// Get the current action list of drone j
+void Solution::GetDroneActionList(int j, std::vector<DroneAction>& lst) {
+	// Fill lst with all actions in drone j's list
+	for (DroneAction a : m_Aa.at(j)) {
+		lst.push_back(a);
+	}
+}
+
+// Get the current action list of UGV j
+void Solution::GetUGVActionList(int j, std::vector<UGVAction>& lst) {
+	// Fill lst with all actions in UGV j's list
+	for (UGVAction a : m_Ag.at(j)) {
+		lst.push_back(a);
+	}
+}
+
+// Returns the time of the last action of UGV j
+double Solution::GetTotalTourTime(int j) {
+	if (!m_Ag.at(j).empty()) {
+		return m_Ag.at(j).back().fCompletionTime;
+	}
+	return 0.0;
+}
+
+// Completely clears the current solution (deletes all actions and completion times)
+void Solution::ClearSolution() {
+	// Clear all action vectors
+	for (int j = 0; j < m_input->GetMa(); j++) {
+		m_Aa.at(j).clear();
+	}
+	for (int j = 0; j < m_input->GetMg(); j++) {
+		m_Ag.at(j).clear();
+	}
+}
+
+// Deletes the current plan (actions and completion times) for drone j
+void Solution::ClearDroneSolution(int j) {
+	m_Aa.at(j).clear();
+}
+
+// Deletes the current plan (actions and completion times) for UGV j
+void Solution::ClearUGVSolution(int j) {
+	m_Ag.at(j).clear();
+}
+
+// Helper function to convert DroneActionType enum to string
+std::string Solution::droneActionTypeToString(E_DroneActionTypes actionType) {
+	switch (actionType) {
+		//        case E_DroneActionTypes::Start: return "start";
+	case E_DroneActionTypes::e_AtUGV: return "perch_on_UGV";
+	case E_DroneActionTypes::e_LaunchFromUGV: return "takeoff_from_UGV";
+		//        case E_DroneActionTypes::MoveToLocation: return "move_to_location";
+		//        case E_DroneActionTypes::ServiceNode: return "service_node";
+	case E_DroneActionTypes::e_LandOnUGV: return "land_on_UGV";
+	case E_DroneActionTypes::e_KernelEnd: return "end";
+	default:return "unknown";
+	}
+}
+
+// Helper function to convert UGVActionType enum to string
+std::string Solution::ugvActionTypeToString(E_UGVActionTypes actionType) {
+	switch (actionType) {
+		//        case E_UGVActionTypes::Start: return "start";
+	case E_UGVActionTypes::e_MoveToWaypoint: return "move_to_location";
+	case E_UGVActionTypes::e_LaunchDrone: return "allow_takeoff_by_UAV";
+		//        case E_UGVActionTypes::ServiceNode: return "service_node";
+	case E_UGVActionTypes::e_ReceiveDrone: return "allow_landing_by_UAV";
+	case E_UGVActionTypes::e_KernelEnd: return "end";
+	default:return "unknown";
+	}
+}
+
+// Reduce precision of floating point number
+std::string Solution::floatingPointToString(double val) {
+	std::stringstream stream;
+	stream << std::fixed << std::setprecision(1) << val;
+	return stream.str();
+}
