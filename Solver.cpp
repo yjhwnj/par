@@ -1,4 +1,35 @@
-﻿#include "Solver.h"
+#include "Solver.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <fstream>
+#include <limits>
+#include <numeric>
+#include <random>
+
+namespace {
+
+double getEnvDouble(const char* key, double fallback) {
+    if (const char* v = std::getenv(key)) {
+        try { return std::stod(std::string(v)); }
+        catch (...) { return fallback; }
+    }
+    return fallback;
+}
+
+double safePathDistance(Pathfinder* pathfinder, Point start, Point end) {
+    if (!pathfinder) {
+        return distAtoB(start.x, start.y, end.x, end.y);
+    }
+    double dist = pathfinder->get_path_distance(start, end);
+    if (!(dist < INF)) {
+        dist = distAtoB(start.x, start.y, end.x, end.y);
+    }
+    return dist;
+}
+
+} // namespace
 
 Solver::Solver(Pathfinder* pathfinder) {
     mPathfinder = pathfinder;
@@ -6,247 +37,263 @@ Solver::Solver(Pathfinder* pathfinder) {
 
 Solver::~Solver() {}
 
-/**
- * 生成“左右分区 + S 形全覆盖”的巡航路线
- * 约定：
- * - 地图边界：[-5000, 5000] × [-5000, 5000]
- * - 竖直分割线 x = 0；UAV_0 负责左半区（[-5000,0]），UAV_1 负责右半区（[0,5000]）
- * - 其他 UAV 若存在：继续按左右交替分区（偶数编号左、奇数编号右）
- * - 每个 UAV 在自己分区内按 S 形往返扫描；默认条带宽度 stripe_w = 700（可用环境变量 STRIPE_W 覆盖）
- * - UAV 从 UGV_0 的 depot 起降；用 mPathfinder 计算路径长度，时间 = 距离 / 速度
- */
 void Solver::GeneratePatrolPlan(PatrollingInput* input, Solution* sol_final) {
-    if (DEBUG_SOLVER)
-        printf("\n--- Generating Patrol Routes (Split map + S-sweep) ---\n");
+    if (DEBUG_SOLVER) {
+        printf("\n--- Generating adaptive coverage patrol ---\n");
+    }
 
     sol_final->ClearSolution();
 
-    // 1) UGV 固定在库位：保持原有风格
-    for (int j = 0; j < input->GetMg(); ++j) {
-        double depot_x, depot_y;
-        input->GetDepot(j, &depot_x, &depot_y);
-        sol_final->PushUGVAction(j, { E_UGVActionTypes::e_AtDepot, depot_x, depot_y, 0.0 });
-        sol_final->PushUGVAction(j, { E_UGVActionTypes::e_KernelEnd, depot_x, depot_y, 3600.0 });
-    }
-
-    // 2) 地图与扫描参数
-    const double minX = -5000.0, maxX = 5000.0;
-    const double minY = -5000.0, maxY = 5000.0;
-    const double splitX = 0.0; // 左右分界线
-
-    // ---- 新增：从环境变量读取条带宽（默认 700），不改变其余逻辑 ----
-    double stripe_w = 700.0;
-    if (const char* env = std::getenv("STRIPE_W")) {
-        char* endp = nullptr;
-        double v = std::strtod(env, &endp);
-        if (endp != env && v > 1.0) stripe_w = v;
-    }
-
-    auto build_sweep_waypoints = [&](double xL, double xR, double yB, double yT) {
-        // 生成从左到右（或右到左）按条带摆动的 S 形路径
-        std::vector<Point> wps;
-        bool up = true; // 第一条从下(yB)扫到上(yT)
-        // 计算条带中心线（沿 X 方向步进）
-        double width = std::max(1.0, std::fabs(xR - xL));
-        int cols = std::max(1, (int)std::ceil(width / stripe_w));
-        double dx = (xR - xL) / cols;
-
-        double x = xL + dx * 0.5; // 第一条带的“中心”x
-        for (int c = 0; c < cols; ++c, x += dx) {
-            if (up) {
-                wps.push_back({ x, yB });
-                wps.push_back({ x, yT });
-            }
-            else {
-                wps.push_back({ x, yT });
-                wps.push_back({ x, yB });
-            }
-            up = !up;
-        }
-        return wps;
-    };
-
-    // 3) 为每个 UAV 设定分区并生成路径
-    //    偶数 idx（0,2,4...）→ 左区；奇数 idx（1,3,5...）→ 右区
-    for (int j_a = 0; j_a < input->GetMa(); ++j_a) {
-        // 起降点（用 UGV_0 depot）
-        double depot_x, depot_y;
-        input->GetDepot(0, &depot_x, &depot_y);
-
-        // 分区
-        bool left_side = (j_a % 2 == 0);
-        double xL = left_side ? minX : splitX;
-        double xR = left_side ? splitX : maxX;
-        double yB = minY, yT = maxY;
-
-        // 生成 S 形路径点
-        std::vector<Point> waypoints = build_sweep_waypoints(xL, xR, yB, yT);
-
-        // 推动作（时间用距离/速度推进）
-        UAV uav = input->getUAV(j_a);
-        double current_time = 0.0;
-        Point  current_pos = { depot_x, depot_y };
-
-        // 起始：在车上
-        sol_final->PushDroneAction(j_a, { E_DroneActionTypes::e_AtUGV, depot_x, depot_y, 0.0 });
-
-        // 起飞
-        current_time += uav.timeNeededToLaunch;
-        sol_final->PushDroneAction(j_a, { E_DroneActionTypes::e_LaunchFromUGV, depot_x, depot_y, current_time });
-
-        // 从库位飞到本 UAV 分区的第一个点（若存在）
-        if (!waypoints.empty()) {
-            double dist0 = mPathfinder->get_path_distance(current_pos, waypoints.front());
-            if (dist0 < INF) {
-                current_time += dist0 / input->GetDroneVMax(j_a);
-                sol_final->PushDroneAction(j_a, { E_DroneActionTypes::e_MoveToNode, waypoints.front().x, waypoints.front().y, current_time, -1 });
-                current_pos = waypoints.front();
-            }
-            else if (DEBUG_SOLVER) {
-                printf("Warning: UAV %d cannot reach its zone start point.\n", j_a);
+    const int ugv_count = input->GetMg();
+    std::vector<std::vector<int>> ugv_to_drones;
+    input->AssignDronesToUGV(ugv_to_drones);
+    std::vector<int> drone_home(input->GetMa(), 0);
+    for (int g = 0; g < static_cast<int>(ugv_to_drones.size()); ++g) {
+        for (int drone_id : ugv_to_drones[g]) {
+            if (drone_id >= 0 && drone_id < input->GetMa()) {
+                drone_home[drone_id] = g;
             }
         }
+    }
 
-        // 扫描各条带
-        for (size_t k = 1; k < waypoints.size(); ++k) {
-            const Point& nxt = waypoints[k];
-            double dist = mPathfinder->get_path_distance(current_pos, nxt);
-            if (dist >= INF) {
-                if (DEBUG_SOLVER) printf("Warning: path blocked for UAV %d between sweeps.\n", j_a);
+    for (int g = 0; g < ugv_count; ++g) {
+        double depot_x, depot_y;
+        input->GetDepot(g, &depot_x, &depot_y);
+        sol_final->PushUGVAction(g, { E_UGVActionTypes::e_AtDepot, depot_x, depot_y, 0.0 });
+    }
+
+    const BoundingBox bounds = input->GetMapBounds();
+    const double grid_res = std::max(10.0, getEnvDouble("COVERAGE_GRID", 400.0));
+    const double obstacle_buffer = std::max(0.0, getEnvDouble("COVERAGE_OBS_BUFFER", grid_res * 0.25));
+
+    const double width = std::max(grid_res, bounds.max_x - bounds.min_x);
+    const double height = std::max(grid_res, bounds.max_y - bounds.min_y);
+    const int num_cols = std::max(1, static_cast<int>(std::ceil(width / grid_res)));
+    const int num_rows = std::max(1, static_cast<int>(std::ceil(height / grid_res)));
+    const double col_step = width / num_cols;
+    const double row_step = height / num_rows;
+
+    std::vector<std::vector<Point>> column_cells(num_cols);
+    for (int c = 0; c < num_cols; ++c) {
+        double cx = bounds.min_x + col_step * (c + 0.5);
+        cx = std::clamp(cx, bounds.min_x, bounds.max_x);
+        for (int r = 0; r < num_rows; ++r) {
+            double cy = bounds.min_y + row_step * (r + 0.5);
+            cy = std::clamp(cy, bounds.min_y, bounds.max_y);
+            if (input->IsLocationInObstacle(cx, cy, obstacle_buffer)) {
                 continue;
             }
-            current_time += dist / input->GetDroneVMax(j_a);
-            sol_final->PushDroneAction(j_a, { E_DroneActionTypes::e_MoveToNode, nxt.x, nxt.y, current_time, -1 });
-            current_pos = nxt;
+            column_cells[c].push_back({ cx, cy });
+        }
+        std::sort(column_cells[c].begin(), column_cells[c].end(),
+            [](const Point& a, const Point& b) { return a.y < b.y; });
+    }
+
+    const int drone_count = input->GetMa();
+    std::vector<double> drone_finish_times(drone_count, 0.0);
+
+    if (drone_count == 0) {
+        for (int g = 0; g < ugv_count; ++g) {
+            double depot_x, depot_y;
+            input->GetDepot(g, &depot_x, &depot_y);
+            sol_final->PushUGVAction(g, { E_UGVActionTypes::e_ReceiveDrone, depot_x, depot_y, 0.0 });
+            sol_final->PushUGVAction(g, { E_UGVActionTypes::e_KernelEnd, depot_x, depot_y, 0.0 });
+        }
+        return;
+    }
+
+    const int cols_per_drone = std::max(1, static_cast<int>(std::ceil(static_cast<double>(num_cols) /
+        std::max(1, drone_count))));
+
+    for (int j = 0; j < drone_count; ++j) {
+        int start_col = j * cols_per_drone;
+        int end_col = (j == drone_count - 1) ? num_cols : std::min(num_cols, start_col + cols_per_drone);
+        if (start_col >= num_cols) {
+            start_col = num_cols;
+            end_col = num_cols;
         }
 
-        // 回库并降落
-        double dist_back = mPathfinder->get_path_distance(current_pos, { depot_x, depot_y });
-        if (dist_back < INF) {
-            current_time += dist_back / input->GetDroneVMax(j_a);
-            sol_final->PushDroneAction(j_a, { E_DroneActionTypes::e_MoveToUGV, depot_x, depot_y, current_time });
-            current_time += uav.timeNeededToLand;
-            sol_final->PushDroneAction(j_a, { E_DroneActionTypes::e_LandOnUGV, depot_x, depot_y, current_time });
+        std::vector<Point> sweep_points;
+        bool go_up = true;
+        for (int c = start_col; c < end_col; ++c) {
+            auto cells = column_cells[c];
+            if (cells.empty()) {
+                continue;
+            }
+            if (!go_up) {
+                std::reverse(cells.begin(), cells.end());
+            }
+            sweep_points.insert(sweep_points.end(), cells.begin(), cells.end());
+            go_up = !go_up;
         }
-        // 结尾
-        sol_final->PushDroneAction(j_a, { E_DroneActionTypes::e_KernelEnd, depot_x, depot_y, current_time });
+
+        int home_ugv = (j < static_cast<int>(drone_home.size())) ? drone_home[j] : 0;
+        if (home_ugv < 0 || home_ugv >= ugv_count) {
+            home_ugv = 0;
+        }
+
+        double depot_x, depot_y;
+        input->GetDepot(home_ugv, &depot_x, &depot_y);
+        sol_final->PushDroneAction(j, { E_DroneActionTypes::e_AtUGV, depot_x, depot_y, 0.0 });
+
+        if (sweep_points.empty()) {
+            sol_final->PushDroneAction(j, { E_DroneActionTypes::e_KernelEnd, depot_x, depot_y, 0.0 });
+            continue;
+        }
+
+        UAV uav = input->getUAV(j);
+        const double speed = std::max(1.0, input->GetDroneVMax(j));
+        double current_time = 0.0;
+        Point current_pos{ depot_x, depot_y };
+
+        current_time += uav.timeNeededToLaunch;
+        sol_final->PushDroneAction(j, { E_DroneActionTypes::e_LaunchFromUGV, depot_x, depot_y, current_time });
+
+        for (const auto& target : sweep_points) {
+            double dist = safePathDistance(mPathfinder, current_pos, target);
+            if (!(dist < INF)) {
+                if (DEBUG_SOLVER) {
+                    printf("[WARN] UAV %d cannot reach coverage point (%.1f, %.1f). Skipping.\n",
+                        j, target.x, target.y);
+                }
+                continue;
+            }
+            current_time += dist / speed;
+            sol_final->PushDroneAction(j, { E_DroneActionTypes::e_MoveToNode, target.x, target.y, current_time, -1 });
+            current_pos = target;
+        }
+
+        double dist_home = safePathDistance(mPathfinder, current_pos, { depot_x, depot_y });
+        if (dist_home < INF) {
+            current_time += dist_home / speed;
+            sol_final->PushDroneAction(j, { E_DroneActionTypes::e_MoveToUGV, depot_x, depot_y, current_time });
+        }
+        current_time += uav.timeNeededToLand;
+        sol_final->PushDroneAction(j, { E_DroneActionTypes::e_LandOnUGV, depot_x, depot_y, current_time });
+        sol_final->PushDroneAction(j, { E_DroneActionTypes::e_KernelEnd, depot_x, depot_y, current_time });
+
+        drone_finish_times[j] = current_time;
+    }
+
+    double max_finish = 0.0;
+    for (double t : drone_finish_times) {
+        if (t > max_finish) {
+            max_finish = t;
+        }
+    }
+
+    for (int g = 0; g < ugv_count; ++g) {
+        double depot_x, depot_y;
+        input->GetDepot(g, &depot_x, &depot_y);
+        sol_final->PushUGVAction(g, { E_UGVActionTypes::e_ReceiveDrone, depot_x, depot_y, max_finish });
+        sol_final->PushUGVAction(g, { E_UGVActionTypes::e_KernelEnd, depot_x, depot_y, max_finish });
     }
 
     if (DEBUG_SOLVER) {
-        printf("\n--- Generated Patrol Plan (S-sweep, stripe_w=%.1f) ---\n", stripe_w);
-        sol_final->PrintSolution();
+        printf("--- Coverage patrol generated with %d drones over %d x %d grid ---\n",
+            drone_count, num_cols, num_rows);
     }
 }
 
-
-// *** 原“RunBaseline”保留为任务分派入口（未动） ***
 void Solver::SolveTaskAssignment(PatrollingInput* input, const std::vector<Node>& tasks, Solution* sol_final) {
-    if (DEBUG_SOLVER) printf("\n--- Solving Task Assignment for %zu tasks ---\n", tasks.size());
-
-    std::vector<ClusteringPoint> vctrPoIPoint;
-    for (size_t i = 0; i < tasks.size(); ++i) {
-        vctrPoIPoint.emplace_back(i, tasks[i].location.x, tasks[i].location.y, 0);
+    if (DEBUG_SOLVER) {
+        printf("\n--- Solving task assignment for %zu tasks ---\n", tasks.size());
     }
 
-    std::vector<VRPPoint> depots;
-    std::vector<std::vector<int>> depot_order;
-    std::vector<std::vector<std::vector<int>>> depots_tours;
-
-    int K = 1;
-    int Mp = input->GetMg();
-
-    bool valid_solution = false;
-    while (!valid_solution) {
-        depots.clear();
-        depot_order.clear();
-        depots_tours.clear();
-        sol_final->ClearSolution();
-        valid_solution = true;
-
-        K = std::max(Mp, K);
-        if (K > boost::numeric_cast<int>(tasks.size())) {
-            K = tasks.size();
-        }
-        if (K == 0) break; // No tasks to assign
-
-        for (int k = 0; k < K; k++) {
-            depots_tours.emplace_back();
-        }
-
-        std::vector<std::vector<ClusteringPoint>> clusters;
-        if (K > 1) {
-            mKMeansSolver.SolveKMeans(vctrPoIPoint, K);
-            clusters.resize(K);
-            for (const auto& n : vctrPoIPoint) {
-                clusters[n.cluster].push_back(n);
-            }
-        }
-        else {
-            clusters.push_back(vctrPoIPoint);
-        }
-
-        for (int i = 0; i < K; i++) {
-            double x = 0, y = 0;
-            for (const auto& n : clusters.at(i)) {
-                x += n.x;
-                y += n.y;
-            }
-            if (!clusters.at(i).empty()) {
-                depots.emplace_back(i, x / clusters.at(i).size(), y / clusters.at(i).size());
-            }
-            else {
-                depots.emplace_back(i, 0, 0);
-            }
-        }
-
-        double depot_x, depot_y;
-        input->GetDepot(0, &depot_x, &depot_y);
-        depots.emplace_back(-1, depot_x, depot_y);
-
-        std::vector<std::vector<int>> drones_to_UGV;
-        input->AssignDronesToUGV(drones_to_UGV);
-
-        mVRPSolver.SolveVRP(depots, Mp, depot_order, mPathfinder);
-
-        for (int j_p = 0; j_p < Mp && j_p < boost::numeric_cast<int>(depot_order.size()); j_p++) {
-            int j_actual = j_p % input->GetMg();
-            for (int k : depot_order.at(j_p)) {
-                std::vector<VRPPoint> nodes;
-                for (const auto& n : clusters.at(k)) {
-                    nodes.emplace_back(n.ID, n.x, n.y);
-                }
-                nodes.emplace_back(k, depots.at(k).x, depots.at(k).y);
-
-                std::vector<std::vector<int>> subtours;
-                mVRPSolver.SolveVRP(nodes, boost::numeric_cast<int>(drones_to_UGV.at(j_actual).size()), subtours, mPathfinder);
-                depots_tours.at(k) = subtours;
-
-                for (const auto& subtour : subtours) {
-                    if (!subtour.empty()) {
-                        double tour_length = mPathfinder->get_path_distance({ depots.at(k).x, depots.at(k).y }, { tasks.at(subtour.front()).location.x, tasks.at(subtour.front()).location.y });
-                        for (size_t i = 0; i < subtour.size() - 1; ++i) {
-                            tour_length += mPathfinder->get_path_distance({ tasks.at(subtour[i]).location.x, tasks.at(subtour[i]).location.y }, { tasks.at(subtour[i + 1]).location.x, tasks.at(subtour[i + 1]).location.y });
-                        }
-                        tour_length += mPathfinder->get_path_distance({ tasks.at(subtour.back()).location.x, tasks.at(subtour.back()).location.y }, { depots.at(k).x, depots.at(k).y });
-
-                        if (tour_length > input->GetDroneMaxDist(DRONE_I)) {
-                            K++;
-                            valid_solution = false;
-                            break;
-                        }
-                    }
-                }
-                if (!valid_solution) break;
-            }
-            if (!valid_solution) break;
-        }
-    }
-
-    printf("Task assignment logic is complex. For now, we will skip generating the detailed action list.\n");
-    printf("The important part is that the logic was triggered.\n");
-
-    // 为保持仿真可跑，仍生成巡航（此处会再次调用上面的 S 扫描）
     GeneratePatrolPlan(input, sol_final);
+    if (tasks.empty()) {
+        return;
+    }
+
+    const int ugv_count = input->GetMg();
+    if (ugv_count <= 0) {
+        if (DEBUG_SOLVER) {
+            printf("[WARN] No UGVs available to service tasks.\n");
+        }
+        return;
+    }
+
+    double latest_drone_time = 0.0;
+    for (int j = 0; j < input->GetMa(); ++j) {
+        std::vector<DroneAction> actions;
+        sol_final->GetDroneActionList(j, actions);
+        if (!actions.empty()) {
+            latest_drone_time = std::max(latest_drone_time, actions.back().fCompletionTime);
+        }
+    }
+
+    std::vector<std::vector<int>> ugv_task_indices(ugv_count);
+    std::vector<Point> ugv_positions(ugv_count);
+    for (int g = 0; g < ugv_count; ++g) {
+        double sx, sy;
+        input->GetUGVInitLocal(g, &sx, &sy);
+        ugv_positions[g] = { sx, sy };
+    }
+
+    for (size_t idx = 0; idx < tasks.size(); ++idx) {
+        const Node& task = tasks[idx];
+        Point task_pos{ task.location.x, task.location.y };
+        int best_g = 0;
+        double best_dist = std::numeric_limits<double>::infinity();
+        for (int g = 0; g < ugv_count; ++g) {
+            double dist = safePathDistance(mPathfinder, ugv_positions[g], task_pos);
+            if (dist < best_dist) {
+                best_dist = dist;
+                best_g = g;
+            }
+        }
+        ugv_task_indices[best_g].push_back(static_cast<int>(idx));
+        ugv_positions[best_g] = task_pos;
+    }
+
+    const double service_time = std::max(0.0, getEnvDouble("UGV_SERVICE_TIME", 120.0));
+
+    for (int g = 0; g < ugv_count; ++g) {
+        sol_final->ClearUGVSolution(g);
+        double start_x, start_y;
+        input->GetUGVInitLocal(g, &start_x, &start_y);
+        sol_final->PushUGVAction(g, { E_UGVActionTypes::e_AtDepot, start_x, start_y, 0.0 });
+
+        double current_time = 0.0;
+        Point current_pos{ start_x, start_y };
+        double speed = input->getUGV(g).maxDriveSpeed;
+        if (speed <= 1e-6) {
+            speed = 5.0;
+        }
+
+        for (int task_idx : ugv_task_indices[g]) {
+            if (task_idx < 0 || task_idx >= static_cast<int>(tasks.size())) {
+                continue;
+            }
+            const Node& node = tasks[task_idx];
+            Point dst{ node.location.x, node.location.y };
+            double dist = safePathDistance(mPathfinder, current_pos, dst);
+            if (!(dist < INF)) {
+                if (DEBUG_SOLVER) {
+                    printf("[WARN] UGV %d cannot reach task %s. Skipping.\n", g, node.ID.c_str());
+                }
+                continue;
+            }
+            current_time += dist / speed;
+            sol_final->PushUGVAction(g, { E_UGVActionTypes::e_MoveToNode, dst.x, dst.y, current_time, task_idx });
+            current_time += service_time;
+            current_pos = dst;
+        }
+
+        double dist_home = safePathDistance(mPathfinder, current_pos, { start_x, start_y });
+        if (dist_home < INF) {
+            current_time += dist_home / speed;
+            sol_final->PushUGVAction(g, { E_UGVActionTypes::e_MoveToDepot, start_x, start_y, current_time });
+        }
+
+        current_time = std::max(current_time, latest_drone_time);
+        sol_final->PushUGVAction(g, { E_UGVActionTypes::e_ReceiveDrone, start_x, start_y, current_time });
+        sol_final->PushUGVAction(g, { E_UGVActionTypes::e_KernelEnd, start_x, start_y, current_time });
+    }
+
+    if (DEBUG_SOLVER) {
+        printf("--- UGV assignments generated with horizon %.1f seconds ---\n", latest_drone_time);
+    }
 }
 
 void Solver::solverTSP_LKH(std::vector<TSPVertex>& lst, std::vector<TSPVertex>& result, double multiplier) {
