@@ -3,6 +3,71 @@
 #include "UGV.h"
 #include "UGV.cpp"
 #include "UAV.cpp"
+#include "Utilities.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <limits>
+#include <random>
+
+namespace {
+
+double getEnvDouble(const char* key, double fallback) {
+        if (const char* v = std::getenv(key)) {
+                try { return std::stod(std::string(v)); }
+                catch (...) { return fallback; }
+        }
+        return fallback;
+}
+
+size_t getEnvSizeT(const char* key, size_t fallback) {
+        if (const char* v = std::getenv(key)) {
+                try { return static_cast<size_t>(std::stoll(std::string(v))); }
+                catch (...) { return fallback; }
+        }
+        return fallback;
+}
+
+double pointToSegmentDistance(double px, double py, const Location& a, const Location& b) {
+        const double vx = b.x - a.x;
+        const double vy = b.y - a.y;
+        const double wx = px - a.x;
+        const double wy = py - a.y;
+        const double len_sq = vx * vx + vy * vy;
+        double t = 0.0;
+        if (len_sq > 1e-9) {
+                t = (wx * vx + wy * vy) / len_sq;
+                t = std::clamp(t, 0.0, 1.0);
+        }
+        const double proj_x = a.x + t * vx;
+        const double proj_y = a.y + t * vy;
+        return std::hypot(px - proj_x, py - proj_y);
+}
+
+bool pointOnSegment(double px, double py, const Location& a, const Location& b, double tol) {
+        return pointToSegmentDistance(px, py, a, b) <= tol;
+}
+
+bool pointInPolygon(const Obstacle& polygon, double x, double y, double tol) {
+        if (polygon.size() < 3) return false;
+        bool inside = false;
+        for (size_t i = 0, j = polygon.size() - 1; i < polygon.size(); j = i++) {
+                const Location& pi = polygon[i];
+                const Location& pj = polygon[j];
+
+                if (pointOnSegment(x, y, pi, pj, tol)) {
+                        return true;
+                }
+
+                const bool intersect = ((pi.y > y) != (pj.y > y)) &&
+                        (x < (pj.x - pi.x) * (y - pi.y) / (pj.y - pi.y + 1e-12) + pi.x);
+                if (intersect) inside = !inside;
+        }
+        return inside;
+}
+
+} // namespace
 
 /*
  * Basic constructor. This expects an input file path. The input file should be a yaml file.
@@ -16,8 +81,11 @@ PatrollingInput::PatrollingInput(std::string scenario_input, std::string vehicle
 	if (SANITY_PRINT)
 		printf("Reading input YAML file\n");
 
-	// Read status
-	bool read_success = true;
+        // Read status
+        bool read_success = true;
+
+        map_bounds = { 0.0, 0.0, 0.0, 0.0 };
+        bounds_initialized = false;
 
 	try {
 		// Load the YAML file
@@ -68,16 +136,38 @@ PatrollingInput::PatrollingInput(std::string scenario_input, std::string vehicle
 		read_success = false;
 	}
 
-	// Verify that we successfully read the input file
-	if (!read_success) {
-		// Input file not formatted correctly, hard fail!
-		fprintf(stderr, "[MASPInput::MASPInput] : Input file format off\n");
-		exit(1);
-	}
-	else if (SANITY_PRINT) {
-		printf("Successfully read input!\n");
-		printf("N = %d, Ma = %d, Mg = %d\n\n", GetN(), GetMa(), GetMg());
-	}
+        // Verify that we successfully read the input file
+        if (!read_success) {
+                // Input file not formatted correctly, hard fail!
+                fprintf(stderr, "[MASPInput::MASPInput] : Input file format off\n");
+                exit(1);
+        }
+        else if (SANITY_PRINT) {
+                printf("Successfully read input!\n");
+                printf("N = %d, Ma = %d, Mg = %d\n\n", GetN(), GetMa(), GetMg());
+        }
+
+        if (!bounds_initialized) {
+                map_bounds = { -5000.0, 5000.0, -5000.0, 5000.0 };
+                bounds_initialized = true;
+        }
+        else {
+                const double margin = getEnvDouble("MAP_BOUND_MARGIN", 100.0);
+                map_bounds.min_x -= margin;
+                map_bounds.max_x += margin;
+                map_bounds.min_y -= margin;
+                map_bounds.max_y += margin;
+        }
+
+        const size_t fallback_hidden = hidden_nodes.empty() ? 10 : hidden_nodes.size();
+        size_t desired_hidden = getEnvSizeT("HIDDEN_TASK_COUNT", fallback_hidden);
+        if (desired_hidden < hidden_nodes.size()) {
+                desired_hidden = hidden_nodes.size();
+        }
+        const size_t additional_hidden = (desired_hidden > hidden_nodes.size())
+                ? (desired_hidden - hidden_nodes.size())
+                : 0;
+        GenerateRandomHiddenTasks(additional_hidden);
 }
 
 
@@ -159,18 +249,21 @@ void PatrollingInput::parseAgents(const YAML::Node& agentNodes) {
 			uav.ID = agentNode["ID"].as<std::string>();
 			uav.type = agentNode["type"].as<std::string>();
 			uav.subtype = agentNode["subtype"].as<std::string>();
-			uav.location.x = agentNode["location"]["x"].as<double>();
-			uav.location.y = agentNode["location"]["y"].as<double>();
+                        uav.location.x = agentNode["location"]["x"].as<double>();
+                        uav.location.y = agentNode["location"]["y"].as<double>();
+                        updateBounds(uav.location.x, uav.location.y);
 			uav.battery_state.max_battery_energy = agentNode["battery_state"]["max_battery_energy"].as<double>();
 			uav.battery_state.current_battery_energy = agentNode["battery_state"]["current_battery_energy"].as<double>();
 			uav.stratum = agentNode["stratum"].as<std::string>();
 			uav.charging_pad_ID = agentNode["charging_pad_ID"].as<std::string>();
 
 			if (agentNode["patrol_zone"]) {
-				uav.patrol_zone.min_x = agentNode["patrol_zone"]["min_x"].as<double>();
-				uav.patrol_zone.max_x = agentNode["patrol_zone"]["max_x"].as<double>();
-				uav.patrol_zone.min_y = agentNode["patrol_zone"]["min_y"].as<double>();
-				uav.patrol_zone.max_y = agentNode["patrol_zone"]["max_y"].as<double>();
+                                uav.patrol_zone.min_x = agentNode["patrol_zone"]["min_x"].as<double>();
+                                uav.patrol_zone.max_x = agentNode["patrol_zone"]["max_x"].as<double>();
+                                uav.patrol_zone.min_y = agentNode["patrol_zone"]["min_y"].as<double>();
+                                uav.patrol_zone.max_y = agentNode["patrol_zone"]["max_y"].as<double>();
+                                updateBounds(uav.patrol_zone.min_x, uav.patrol_zone.min_y);
+                                updateBounds(uav.patrol_zone.max_x, uav.patrol_zone.max_y);
 			}
 			else {
 				uav.patrol_zone = { 0,0,0,0 };
@@ -194,8 +287,9 @@ void PatrollingInput::parseAgents(const YAML::Node& agentNodes) {
 			ugv.ID = agentNode["ID"].as<std::string>();
 			ugv.type = agentNode["type"].as<std::string>();
 			ugv.subtype = agentNode["subtype"].as<std::string>();
-			ugv.location.x = agentNode["location"]["x"].as<double>();
-			ugv.location.y = agentNode["location"]["y"].as<double>();
+                        ugv.location.x = agentNode["location"]["x"].as<double>();
+                        ugv.location.y = agentNode["location"]["y"].as<double>();
+                        updateBounds(ugv.location.x, ugv.location.y);
 			ugv.battery_state.max_battery_energy = agentNode["battery_state"]["max_battery_energy"].as<double>();
 			ugv.battery_state.current_battery_energy = agentNode["battery_state"]["current_battery_energy"].as<double>();
 			const YAML::Node& charging_pads = agentNode["charging_pads"];
@@ -251,8 +345,9 @@ void PatrollingInput::parseScenario(const YAML::Node& scenario) {
 		Node node;
 		node.ID = nodeNode["ID"].as<std::string>();
 		node.type = nodeNode["type"].as<std::string>();
-		node.location.x = nodeNode["location"]["x"].as<double>();
-		node.location.y = nodeNode["location"]["y"].as<double>();
+                node.location.x = nodeNode["location"]["x"].as<double>();
+                node.location.y = nodeNode["location"]["y"].as<double>();
+                updateBounds(node.location.x, node.location.y);
 		node.time_last_service = nodeNode["time_last_service"].as<double>();
 
 		// *** MODIFICATION START: Parse status and separate nodes ***
@@ -270,8 +365,9 @@ void PatrollingInput::parseScenario(const YAML::Node& scenario) {
 			}
 		}
 		else if (node.type == "depot_a") {
-			depot_x = nodeNode["location"]["x"].as<double>();
-			depot_y = nodeNode["location"]["y"].as<double>();
+                        depot_x = nodeNode["location"]["x"].as<double>();
+                        depot_y = nodeNode["location"]["y"].as<double>();
+                        updateBounds(depot_x, depot_y);
 		}
 		// *** MODIFICATION END ***
 
@@ -294,8 +390,9 @@ void PatrollingInput::parseScenario(const YAML::Node& scenario) {
 			const YAML::Node& verticesNode = obstacleNode["vertices"];
 			for (const auto& vertexNode : verticesNode) {
 				Location vertex;
-				vertex.x = vertexNode["x"].as<double>();
-				vertex.y = vertexNode["y"].as<double>();
+                                vertex.x = vertexNode["x"].as<double>();
+                                vertex.y = vertexNode["y"].as<double>();
+                                updateBounds(vertex.x, vertex.y);
 				current_obstacle.push_back(vertex);
 			}
 			obstacles.push_back(current_obstacle);
@@ -362,13 +459,109 @@ void PatrollingInput::GetDroneInitLocal(int j, double* x, double* y) {
 }
 
 void PatrollingInput::GetUGVInitLocal(int j, double* x, double* y) {
-	if (j >= 0 && j < boost::numeric_cast<int>(mRg.size())) {
-		*x = mRg.at(j).location.x;
-		*y = mRg.at(j).location.y;
-	}
-	else {
-		*x = 0; *y = 0;
-	}
+        if (j >= 0 && j < boost::numeric_cast<int>(mRg.size())) {
+                *x = mRg.at(j).location.x;
+                *y = mRg.at(j).location.y;
+        }
+        else {
+                *x = 0; *y = 0;
+        }
+}
+
+void PatrollingInput::updateBounds(double x, double y) {
+        if (!std::isfinite(x) || !std::isfinite(y)) return;
+        if (!bounds_initialized) {
+                map_bounds = { x, x, y, y };
+                bounds_initialized = true;
+                return;
+        }
+        map_bounds.min_x = std::min(map_bounds.min_x, x);
+        map_bounds.max_x = std::max(map_bounds.max_x, x);
+        map_bounds.min_y = std::min(map_bounds.min_y, y);
+        map_bounds.max_y = std::max(map_bounds.max_y, y);
+}
+
+bool PatrollingInput::IsLocationInObstacle(double x, double y, double buffer) const {
+        for (const auto& obstacle : obstacles) {
+                if (pointInPolygon(obstacle, x, y, buffer)) {
+                        return true;
+                }
+                if (buffer > 0.0) {
+                        for (size_t i = 0; i < obstacle.size(); ++i) {
+                                const Location& a = obstacle[i];
+                                const Location& b = obstacle[(i + 1) % obstacle.size()];
+                                if (pointToSegmentDistance(x, y, a, b) <= buffer) {
+                                        return true;
+                                }
+                        }
+                }
+        }
+        return false;
+}
+
+void PatrollingInput::GenerateRandomHiddenTasks(size_t additional_count) {
+        if (additional_count == 0 || !bounds_initialized) {
+                return;
+        }
+
+        unsigned int seed = static_cast<unsigned int>(getEnvSizeT("HIDDEN_TASK_SEED", 0));
+        if (seed == 0) {
+                std::random_device rd;
+                seed = rd();
+        }
+        std::mt19937 rng(seed);
+
+        std::uniform_real_distribution<double> dist_x(map_bounds.min_x, map_bounds.max_x);
+        std::uniform_real_distribution<double> dist_y(map_bounds.min_y, map_bounds.max_y);
+
+        const double min_spacing = getEnvDouble("HIDDEN_TASK_SPACING", 200.0);
+        const double obstacle_buffer = getEnvDouble("HIDDEN_TASK_OBS_BUFFER", 50.0);
+
+        auto isFarEnough = [&](double x, double y) {
+                auto checkSet = [&](const std::vector<Node>& lst) {
+                        for (const auto& node : lst) {
+                                if (distAtoB(x, y, node.location.x, node.location.y) < min_spacing) {
+                                        return false;
+                                }
+                        }
+                        return true;
+                };
+                return checkSet(nodes) && checkSet(hidden_nodes);
+        };
+
+        size_t generated = 0;
+        size_t attempts = 0;
+        const size_t max_attempts = additional_count * 1000 + 1000;
+        const size_t id_offset = hidden_nodes.size();
+
+        while (generated < additional_count && attempts < max_attempts) {
+                ++attempts;
+                double x = dist_x(rng);
+                double y = dist_y(rng);
+
+                if (IsLocationInObstacle(x, y, obstacle_buffer)) {
+                        continue;
+                }
+                if (!isFarEnough(x, y)) {
+                        continue;
+                }
+
+                Node node;
+                node.ID = "hidden_auto_" + std::to_string(id_offset + generated);
+                node.type = "air_only";
+                node.location = { x, y };
+                node.time_last_service = 0.0;
+                node.is_hidden = true;
+
+                hidden_nodes.push_back(node);
+                updateBounds(x, y);
+                ++generated;
+        }
+
+        if (generated < additional_count) {
+                fprintf(stderr, "[WARN] Requested %zu random hidden nodes, generated %zu due to space constraints.\n",
+                        additional_count, generated);
+        }
 }
 
 double PatrollingInput::GetDroneMaxDist(int j) {

@@ -23,11 +23,18 @@
 
  // *** MODIFICATION HERE: Add status to Node ***
 struct Node {
-	std::string ID;
-	std::string type;
-	Location location;
-	double time_last_service;
-	bool is_hidden;
+        std::string ID;
+        std::string type;
+        Location location;
+        double time_last_service;
+        bool is_hidden;
+};
+
+struct BoundingBox {
+        double min_x;
+        double max_x;
+        double min_y;
+        double max_y;
 };
 
 using Obstacle = std::vector<Location>;
@@ -46,9 +53,13 @@ public:
 	const std::vector<Node>& GetNodes() const { return nodes; }
 
 	// *** MODIFICATION HERE: Add getter for hidden nodes ***
-	const std::vector<Node>& GetHiddenNodes() const { return hidden_nodes; }
+        const std::vector<Node>& GetHiddenNodes() const { return hidden_nodes; }
 
-	const std::vector<Obstacle>& GetObstacles() const { return obstacles; }
+        const BoundingBox& GetMapBounds() const { return map_bounds; }
+
+        const std::vector<Obstacle>& GetObstacles() const { return obstacles; }
+
+        bool IsLocationInObstacle(double x, double y, double buffer = 0.0) const;
 
 	// ... (rest of the getters remain the same) ...
 	void GetDepot(int j, double* x, double* y);
@@ -70,19 +81,24 @@ public:
 	double LowerBound();
 
 private:
-	std::vector<UAV> mRa;
-	std::vector<UGV> mRg;
+        std::vector<UAV> mRa;
+        std::vector<UGV> mRg;
 
-	std::vector<Node> nodes; // This will now only store VISIBLE nodes
+        std::vector<Node> nodes; // This will now only store VISIBLE nodes
 
-	// *** MODIFICATION HERE: Add storage for hidden nodes ***
-	std::vector<Node> hidden_nodes;
+        // *** MODIFICATION HERE: Add storage for hidden nodes ***
+        std::vector<Node> hidden_nodes;
 
-	std::vector<Obstacle> obstacles;
-	double depot_x;
-	double depot_y;
-	void parseAgents(const YAML::Node& agents);
-	void parseScenario(const YAML::Node& scenario);
-	void parseUAVs(const YAML::Node& UAVs);
-	void parseUGVs(const YAML::Node& UGVs);
+        BoundingBox map_bounds;
+        bool bounds_initialized = false;
+
+        std::vector<Obstacle> obstacles;
+        double depot_x;
+        double depot_y;
+        void parseAgents(const YAML::Node& agents);
+        void parseScenario(const YAML::Node& scenario);
+        void parseUAVs(const YAML::Node& UAVs);
+        void parseUGVs(const YAML::Node& UGVs);
+        void updateBounds(double x, double y);
+        void GenerateRandomHiddenTasks(size_t additional_count);
 };

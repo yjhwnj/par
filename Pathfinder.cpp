@@ -27,17 +27,18 @@ Pathfinder::~Pathfinder() {}
 void Pathfinder::initialize(const PatrollingInput* input) {
     if (m_initialized) return;
 
-    m_map_min_x = -5000; m_map_max_x = 5000;
-    m_map_min_y = -5000; m_map_max_y = 5000;
+    BoundingBox bounds = input->GetMapBounds();
+    m_map_min_x = bounds.min_x;
+    m_map_max_x = bounds.max_x;
+    m_map_min_y = bounds.min_y;
+    m_map_max_y = bounds.max_y;
 
-    for (const auto& node : input->GetNodes()) {
-        if (node.location.x < m_map_min_x) m_map_min_x = node.location.x;
-        if (node.location.x > m_map_max_x) m_map_max_x = node.location.x;
-        if (node.location.y < m_map_min_y) m_map_min_y = node.location.y;
-        if (node.location.y > m_map_max_y) m_map_max_y = node.location.y;
+    if (!(m_map_min_x < m_map_max_x) || !(m_map_min_y < m_map_max_y)) {
+        m_map_min_x = -5000.0;
+        m_map_max_x = 5000.0;
+        m_map_min_y = -5000.0;
+        m_map_max_y = 5000.0;
     }
-    m_map_min_x -= 200; m_map_max_x += 200;
-    m_map_min_y -= 200; m_map_max_y += 200;
 
     m_grid_width = static_cast<int>(std::ceil((m_map_max_x - m_map_min_x) / m_grid_resolution));
     m_grid_height = static_cast<int>(std::ceil((m_map_max_y - m_map_min_y) / m_grid_resolution));
